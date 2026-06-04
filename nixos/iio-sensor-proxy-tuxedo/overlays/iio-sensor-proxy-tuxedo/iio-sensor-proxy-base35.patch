@@ -1,0 +1,1640 @@
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+index 6330a0a..b806823 100644
+--- a/.gitlab-ci.yml
++++ b/.gitlab-ci.yml
+@@ -16,6 +16,7 @@ variables:
+                 python3-gobject
+                 python3-dbusmock
+                 python3-psutil
++                python3-packaging
+                 umockdev
+ 
+ workflow:
+@@ -27,8 +28,9 @@ build_stable:
+   before_script:
+     # Undo delangification present in the Fedora Docker images
+     - rm -f /etc/rpm/macros.image-language-conf
+-    - dnf update -y && dnf install -y $DEPENDENCIES
+-    - dnf reinstall -y glib2
++    - if [ -x /bin/dnf ]; then dnf update -y; else dnf5 update -y; fi
++    - if [ -x /bin/dnf ]; then dnf install -y $DEPENDENCIES; else dnf5 install -y $DEPENDENCIES; fi
++    - if [ -x /bin/dnf ]; then dnf reinstall -y glib2; else dnf5 reinstall -y glib2; fi
+   script:
+     - meson -Dtests=true -Dgtk_doc=true -Dgtk-tests=true _build
+     - ninja -v -C _build
+@@ -36,9 +38,22 @@ build_stable:
+     - ninja -v -C _build uninstall
+     - ninja -v -C _build dist
+     - meson test -C _build
++    - ninja -C  _build/ iio-sensor-proxy-doc
+   artifacts:
+     when: always
+-    name: "iio-sensor-proxy-${CI_COMMIT_REF_NAME}"
+     paths:
+       - "${CI_PROJECT_DIR}/_build/meson-logs"
+       - "${CI_PROJECT_DIR}/_build/meson-dist"
++      - "${CI_PROJECT_DIR}/_build/docs/html/"
++
++pages:
++  needs:
++    - build_stable
++  script:
++    - find _build/docs/html/
++    - mv _build/docs/html public
++  artifacts:
++    paths:
++      - public
++  only:
++    - master
+diff --git a/data/80-iio-sensor-proxy.rules b/data/80-iio-sensor-proxy.rules
+index 85d93f9..3b8a149 100644
+--- a/data/80-iio-sensor-proxy.rules
++++ b/data/80-iio-sensor-proxy.rules
+@@ -10,6 +10,7 @@ SUBSYSTEM=="iio", TEST=="scan_elements/in_accel_x_en", TEST=="scan_elements/in_a
+ SUBSYSTEM=="iio", TEST=="scan_elements/in_rot_from_north_magnetic_tilt_comp_en", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-buffer-compass"
+ SUBSYSTEM=="iio", TEST=="in_illuminance_input", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-als"
+ SUBSYSTEM=="iio", TEST=="in_illuminance0_input", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-als"
++SUBSYSTEM=="iio", TEST=="in_illuminance_clear_raw", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-als"
+ SUBSYSTEM=="iio", TEST=="in_illuminance_raw", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-als"
+ SUBSYSTEM=="iio", TEST=="in_intensity_clear_raw", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-poll-als"
+ SUBSYSTEM=="iio", TEST=="scan_elements/in_intensity_both_en", ENV{IIO_SENSOR_PROXY_TYPE}+="iio-buffer-als"
+diff --git a/src/drivers.h b/src/drivers.h
+index b760faa..910b2dc 100644
+--- a/src/drivers.h
++++ b/src/drivers.h
+@@ -6,6 +6,8 @@
+  * the Free Software Foundation.
+  */
+ 
++#pragma once
++
+ #include <glib.h>
+ #include <gudev/gudev.h>
+ 
+@@ -17,6 +19,7 @@ typedef enum {
+ 	DRIVER_TYPE_LIGHT,
+ 	DRIVER_TYPE_COMPASS,
+ 	DRIVER_TYPE_PROXIMITY,
++	DRIVER_TYPE_HINGE_ANGLE,
+ } DriverType;
+ 
+ typedef enum {
+@@ -51,11 +54,23 @@ typedef void (*ReadingsUpdateFunc) (SensorDevice *sensor_device,
+ 				    gpointer      readings,
+ 				    gpointer      user_data);
+ 
++typedef enum {
++	TABLET_MODE_LAPTOP,
++	TABLET_MODE_TABLET,
++	TABLET_MODE_UNKNOWN,
++} TabletMode;
++
++typedef struct {
++	gdouble angle;
++} HingeAngleReadings;
+ 
+ typedef struct {
+ 	const char             *driver_name;
+ 	DriverType              type;
+ 
++	gboolean       (*get_property) (SensorDevice       *device,
++					const char         *property,
++					GValue             *value);
+ 	gboolean       (*discover)    (GUdevDevice        *device);
+ 	SensorDevice * (*open)        (GUdevDevice        *device);
+ 	void           (*set_polling) (SensorDevice       *device,
+@@ -65,8 +80,10 @@ typedef struct {
+ 
+ struct SensorDevice {
+ 	SensorDriver        *drv;
++	GUdevDevice         *udev_device;
+ 	gpointer             priv;
+ 	char                *name;
++	AccelLocation       location;
+ 
+ 	/* Callback function and data as pass to driver_open() */
+ 	ReadingsUpdateFunc   callback_func;
+@@ -77,25 +94,11 @@ static inline gboolean
+ driver_discover (SensorDriver *driver,
+ 		 GUdevDevice  *device)
+ {
+-	AccelLocation location;
+-
+ 	g_return_val_if_fail (driver, FALSE);
+ 	g_return_val_if_fail (driver->discover, FALSE);
+ 	g_return_val_if_fail (device, FALSE);
+ 
+-	if (!driver->discover (device))
+-		return FALSE;
+-
+-	if (driver->type != DRIVER_TYPE_ACCEL)
+-		return TRUE;
+-
+-	location = setup_accel_location (device);
+-	if (location == ACCEL_LOCATION_DISPLAY)
+-		return TRUE;
+-
+-	g_debug ("Ignoring accelerometer in location '%s'",
+-		 accel_location_to_string (location));
+-	return FALSE;
++	return driver->discover (device);
+ }
+ 
+ static inline SensorDevice *
+@@ -115,8 +118,15 @@ driver_open (SensorDriver       *driver,
+ 	if (!sensor_device)
+ 		return NULL;
+ 	sensor_device->drv = driver;
++	sensor_device->udev_device = g_object_ref (device);
+ 	sensor_device->callback_func = callback_func;
+ 	sensor_device->user_data = user_data;
++
++	if (driver->type == DRIVER_TYPE_ACCEL)
++		sensor_device->location = setup_accel_location (device);
++	else
++		sensor_device->location = ACCEL_LOCATION_DISPLAY;
++
+ 	return sensor_device;
+ }
+ 
+@@ -144,11 +154,27 @@ driver_close (SensorDevice *sensor_device)
+ 	g_return_if_fail (sensor_device);
+ 	driver_set_polling (sensor_device, FALSE);
+ 	g_clear_pointer (&sensor_device->name, g_free);
++	g_clear_object (&sensor_device->udev_device);
+ 	driver = sensor_device->drv;
+ 	g_return_if_fail (driver->close);
+ 	driver->close (sensor_device);
+ }
+ 
++static inline gboolean
++driver_get_property (SensorDevice *sensor_device,
++		     const char *property,
++		     GValue *value)
++{
++	SensorDriver *driver;
++
++	g_return_val_if_fail (sensor_device, FALSE);
++	driver = sensor_device->drv;
++	g_return_val_if_fail (driver, FALSE);
++	g_return_val_if_fail (driver->get_property, FALSE);
++
++	return driver->get_property (sensor_device, property, value);
++}
++
+ extern SensorDriver iio_buffer_accel;
+ extern SensorDriver iio_poll_accel;
+ extern SensorDriver input_accel;
+diff --git a/src/drv-iio-buffer-accel.c b/src/drv-iio-buffer-accel.c
+index afa898c..311c840 100644
+--- a/src/drv-iio-buffer-accel.c
++++ b/src/drv-iio-buffer-accel.c
+@@ -198,6 +198,22 @@ iio_buffer_accel_set_polling (SensorDevice *sensor_device,
+ 	}
+ }
+ 
++static gboolean
++iio_buffer_accel_get_property (SensorDevice *sensor_device,
++			       const char   *property,
++			       GValue       *value)
++{
++	DrvData *drv_data = (DrvData *) sensor_device->priv;
++
++	if (g_strcmp0 (property, "location") == 0) {
++		g_value_init (value, G_TYPE_ENUM);
++		g_value_set_enum (value, drv_data->location);
++		return TRUE;
++	}
++
++	return FALSE;
++}
++
+ static SensorDevice *
+ iio_buffer_accel_open (GUdevDevice *device)
+ {
+@@ -247,6 +263,7 @@ SensorDriver iio_buffer_accel = {
+ 	.driver_name = "IIO Buffer accelerometer",
+ 	.type = DRIVER_TYPE_ACCEL,
+ 
++	.get_property = iio_buffer_accel_get_property,
+ 	.discover = iio_buffer_accel_discover,
+ 	.open = iio_buffer_accel_open,
+ 	.set_polling = iio_buffer_accel_set_polling,
+diff --git a/src/drv-iio-poll-accel.c b/src/drv-iio-poll-accel.c
+index e8f43f4..0fbced3 100644
+--- a/src/drv-iio-poll-accel.c
++++ b/src/drv-iio-poll-accel.c
+@@ -94,6 +94,22 @@ iio_poll_accel_set_polling (SensorDevice *sensor_device,
+ 	}
+ }
+ 
++static gboolean
++iio_poll_accel_get_property (SensorDevice *sensor_device,
++			     const char   *property,
++			     GValue       *value)
++{
++	DrvData *drv_data = (DrvData *) sensor_device->priv;
++
++	if (g_strcmp0 (property, "location") == 0) {
++		g_value_init (value, G_TYPE_ENUM);
++		g_value_set_enum (value, drv_data->location);
++		return TRUE;
++	}
++
++	return FALSE;
++}
++
+ static SensorDevice *
+ iio_poll_accel_open (GUdevDevice *device)
+ {
+@@ -133,6 +149,7 @@ SensorDriver iio_poll_accel = {
+ 	.driver_name = "IIO Poll accelerometer",
+ 	.type = DRIVER_TYPE_ACCEL,
+ 
++	.get_property = iio_poll_accel_get_property,
+ 	.discover = iio_poll_accel_discover,
+ 	.open = iio_poll_accel_open,
+ 	.set_polling = iio_poll_accel_set_polling,
+diff --git a/src/drv-iio-poll-light.c b/src/drv-iio-poll-light.c
+index f65a7ca..ea88a79 100644
+--- a/src/drv-iio-poll-light.c
++++ b/src/drv-iio-poll-light.c
+@@ -71,6 +71,7 @@ get_illuminance_channel_path (GUdevDevice *device,
+ 	const char *channels[] = {
+ 		"in_illuminance",
+ 		"in_illuminance0",
++		"in_illuminance_clear",
+ 		"in_intensity_clear"
+ 	};
+ 	char *path = NULL;
+diff --git a/src/drv-input-accel.c b/src/drv-input-accel.c
+index 48f0973..7a1ddcb 100644
+--- a/src/drv-input-accel.c
++++ b/src/drv-input-accel.c
+@@ -190,6 +190,23 @@ first_values (gpointer user_data)
+ 	return G_SOURCE_REMOVE;
+ }
+ 
++static gboolean
++input_accel_get_property (SensorDevice *sensor_device,
++			       const char   *property,
++			       GValue       *value)
++{
++	DrvData *drv_data = (DrvData *) sensor_device->priv;
++
++	if (g_strcmp0 (property, "location") == 0) {
++		g_value_init (value, G_TYPE_ENUM);
++		g_value_set_enum (value, drv_data->location);
++		return TRUE;
++	}
++
++	return FALSE;
++}
++
++
+ static SensorDevice *
+ input_accel_open (GUdevDevice *device)
+ {
+@@ -273,6 +290,7 @@ SensorDriver input_accel = {
+ 	.driver_name = "Input accelerometer",
+ 	.type = DRIVER_TYPE_ACCEL,
+ 
++	.get_property = input_accel_get_property,
+ 	.discover = input_accel_discover,
+ 	.open = input_accel_open,
+ 	.set_polling = input_accel_set_polling,
+diff --git a/src/iio-buffer-utils.c b/src/iio-buffer-utils.c
+index 597e550..d0939d3 100644
+--- a/src/iio-buffer-utils.c
++++ b/src/iio-buffer-utils.c
+@@ -356,27 +356,38 @@ _write_sysfs_int (const char *filename,
+ 	int ret = 0;
+ 	g_autoptr(FILE) sysfsfp = NULL;
+ 	int test;
+-	char *temp;
++	g_autofree char *temp = NULL;
++
+ 	temp = g_build_filename (basedir, filename, NULL);
+ 	sysfsfp = fopen(temp, "w");
+ 	if (sysfsfp == NULL) {
+ 		g_warning ("Could not open for write '%s'", temp);
+-		ret = -errno;
+-		goto error_free;
++		return -errno;
+ 	}
++
++	setvbuf(sysfsfp, NULL, _IONBF, 0);
++
+ 	if (type)
+-		fprintf(sysfsfp, "%d %d", val, val2);
++		ret = fprintf(sysfsfp, "%d %d", val, val2);
+ 	else
+-		fprintf(sysfsfp, "%d", val);
++		ret = fprintf(sysfsfp, "%d", val);
++
+ 	g_clear_pointer (&sysfsfp, fclose);
+ 
++	if (ret < 0) {
++		g_warning ("Could not write to '%s': %s", temp, g_strerror(-ret));
++		return ret;
++	}
++
++	ret = 0;
++
+ 	if (verify) {
+ 		sysfsfp = fopen(temp, "r");
+ 		if (sysfsfp == NULL) {
+ 			g_warning ("Could not open for read '%s'", temp);
+-			ret = -errno;
+-			goto error_free;
++			return -errno;
+ 		}
++
+ 		if (fscanf(sysfsfp, "%d", &test) != 1 ||
+ 		    test != val) {
+ 			g_warning ("Possible failure in int write %d to %s",
+@@ -384,8 +395,7 @@ _write_sysfs_int (const char *filename,
+ 			ret = -1;
+ 		}
+ 	}
+-error_free:
+-	g_free (temp);
++
+ 	return ret;
+ }
+ 
+@@ -673,6 +683,9 @@ enable_sensors (GUdevDevice *dev,
+ 	gboolean ret = FALSE;
+ 	g_autoptr(GError) error = NULL;
+ 
++	g_debug ("%s sensors for device '%s'", enable ? "Enabling" : "Disabling",
++		 g_udev_device_get_sysfs_path (dev));
++
+ 	device_dir = g_build_filename (g_udev_device_get_sysfs_path (dev), "scan_elements", NULL);
+ 	dir = g_dir_open (device_dir, 0, &error);
+ 	if (!dir) {
+@@ -689,7 +702,7 @@ enable_sensors (GUdevDevice *dev,
+ 
+ 		/* Already enabled? */
+ 		path = g_strdup_printf ("scan_elements/%s", name);
+-		if (g_udev_device_get_sysfs_attr_as_boolean (dev, path)) {
++		if (enable && g_udev_device_get_sysfs_attr_as_boolean (dev, path)) {
+ 			g_debug ("Already enabled sensor %s/%s", device_dir, name);
+ 			ret = TRUE;
+ 			g_free (path);
+@@ -699,18 +712,21 @@ enable_sensors (GUdevDevice *dev,
+ 
+ 		/* Enable */
+ 		if (write_sysfs_int (name, device_dir, enable) < 0) {
+-			g_warning ("Could not enable sensor %s/%s", device_dir, name);
++			g_warning ("Could not write %d to %s/%s",
++				   enable, device_dir, name);
+ 			continue;
+ 		}
+ 
+ 		ret = TRUE;
+-		g_debug ("Enabled sensor %s/%s", device_dir, name);
++		g_debug ("%s sensor %s/%s", enable ? "Enabled" : "Disabled",
++			 device_dir, name);
+ 	}
+ 	g_dir_close (dir);
+ 	g_free (device_dir);
+ 
+ 	if (!ret) {
+-		g_warning ("Failed to enable any sensors for device '%s'",
++		g_warning ("Failed to %s any sensors for device '%s'",
++			   enable ? "enable" : "disable",
+ 			   g_udev_device_get_sysfs_path (dev));
+ 	}
+ 
+@@ -785,13 +801,14 @@ buffer_drv_data_free (BufferDrvData *buffer_data)
+ 	if (buffer_data == NULL)
+ 		return;
+ 
+-	enable_sensors (buffer_data->device, 0);
+-	g_clear_object (&buffer_data->device);
+-
++	/* A buffer should be disabled before scan elements to avoid a
++	 * "Device or resource busy" error */
+ 	disable_ring_buffer (buffer_data);
+-
+ 	g_free (buffer_data->trigger_name);
+ 
++	enable_sensors (buffer_data->device, 0);
++	g_clear_object (&buffer_data->device);
++
+ 	for (i = 0; i < buffer_data->channels_count; i++)
+ 		channel_info_free (buffer_data->channels[i]);
+ 	g_free (buffer_data->channels);
+diff --git a/src/iio-sensor-proxy.c b/src/iio-sensor-proxy.c
+index 836e742..8810e78 100644
+--- a/src/iio-sensor-proxy.c
++++ b/src/iio-sensor-proxy.c
+@@ -16,7 +16,10 @@
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdio.h>
++#include <math.h>
++#include <linux/uinput.h>
+ 
++#include <glib-unix.h>
+ #include <gio/gio.h>
+ #include <gudev/gudev.h>
+ #include <polkit/polkit.h>
+@@ -31,7 +34,11 @@
+ #define SENSOR_PROXY_IFACE_NAME         SENSOR_PROXY_DBUS_NAME
+ #define SENSOR_PROXY_COMPASS_IFACE_NAME SENSOR_PROXY_DBUS_NAME ".Compass"
+ 
+-#define NUM_SENSOR_TYPES DRIVER_TYPE_PROXIMITY + 1
++#define NUM_SENSOR_TYPES DRIVER_TYPE_HINGE_ANGLE + 1
++
++
++#define device_type(dev) (dev->drv->type)
++
+ 
+ typedef struct {
+ 	GMainLoop *loop;
+@@ -39,17 +46,16 @@ typedef struct {
+ 	GDBusNodeInfo *introspection_data;
+ 	GDBusConnection *connection;
+ 	guint name_id;
++	int uinput_fd;
+ 	int ret;
+ 
+ 	PolkitAuthority *auth;
+-
+-	SensorDriver      *drivers[NUM_SENSOR_TYPES];
+-	SensorDevice      *devices[NUM_SENSOR_TYPES];
+-	GUdevDevice       *udev_devices[NUM_SENSOR_TYPES];
++	GPtrArray         *devices[NUM_SENSOR_TYPES]; /* SensorDevice */
+ 	GHashTable        *clients[NUM_SENSOR_TYPES]; /* key = D-Bus name, value = watch ID */
+ 
+ 	/* Accelerometer */
+ 	OrientationUp previous_orientation;
++	AccelReadings last_accel_readings[2]; /* For display and base locations */
+ 
+ 	/* Light */
+ 	gdouble previous_level;
+@@ -60,6 +66,9 @@ typedef struct {
+ 
+ 	/* Proximity */
+ 	gboolean previous_prox_near;
++
++	gdouble previous_hinge_angle;
++	TabletMode previous_tablet_mode;
+ } SensorData;
+ 
+ static const SensorDriver * const drivers[] = {
+@@ -89,25 +98,114 @@ driver_type_to_str (DriverType type)
+ 		return "compass";
+ 	case DRIVER_TYPE_PROXIMITY:
+ 		return "proximity";
++	case DRIVER_TYPE_HINGE_ANGLE:
++		return "hinge angle";
+ 	default:
+ 		g_assert_not_reached ();
+ 	}
+ }
+ 
+-#define DRIVER_FOR_TYPE(driver_type) data->drivers[driver_type]
+-#define DEVICE_FOR_TYPE(driver_type) data->devices[driver_type]
+-#define UDEV_DEVICE_FOR_TYPE(driver_type) data->udev_devices[driver_type]
++static const char *
++tablet_mode_to_str (TabletMode mode)
++{
++	switch (mode) {
++	case TABLET_MODE_LAPTOP:
++		return "laptop";
++	case TABLET_MODE_TABLET:
++		return "tablet";
++	default:
++		return "unknown";
++	}
++}
+ 
+ static void sensor_changes (GUdevClient *client,
+ 			    gchar       *action,
+ 			    GUdevDevice *device,
+ 			    SensorData  *data);
+ 
++/* Return the default device used for given sensor type */
++static SensorDevice *
++find_default_device_for_type (SensorData	*data,
++			      DriverType  driver_type)
++{
++	SensorDevice *sensor_device = NULL;
++
++	/* For accelerometers, use the display accelerometer and ignore base accelerometers */
++	if (driver_type == DRIVER_TYPE_ACCEL) {
++		GValue location_prop = G_VALUE_INIT;
++		guint i;
++
++		for (i = 0; i < data->devices[driver_type]->len; i++) {
++			SensorDevice *sd = g_ptr_array_index (data->devices[driver_type], i);
++			AccelLocation location = ACCEL_LOCATION_DISPLAY;
++
++			if (driver_get_property (sd, "location", &location_prop)) {
++				location = g_value_get_enum (&location_prop);
++				g_value_unset (&location_prop);
++			}
++
++			if (location == ACCEL_LOCATION_DISPLAY) {
++				sensor_device = sd;
++				break;
++			}
++		}
++	} else {
++		/* For other sensors, prefer the first one */
++		sensor_device = data->devices[driver_type]->len ? g_ptr_array_index (data->devices[driver_type], 0) : NULL;
++	}
++
++	g_debug ("Default device for %s: %s",
++		 driver_type_to_str (driver_type),
++		 sensor_device ? sensor_device->name : "none");
++
++	return sensor_device;
++}
++
++static SensorDevice *
++find_accel_at (SensorData *data, AccelLocation location)
++{
++	guint i;
++
++	for (i = 0; i < data->devices[DRIVER_TYPE_ACCEL]->len; i++) {
++		SensorDevice *sensor_device =
++			g_ptr_array_index (data->devices[DRIVER_TYPE_ACCEL], i);
++
++		if (sensor_device->location == location)
++			return sensor_device;
++	}
++	return NULL;
++}
++
+ static gboolean
+ driver_type_exists (SensorData *data,
+ 		    DriverType  driver_type)
+ {
+-	return (DRIVER_FOR_TYPE(driver_type) != NULL);
++	return find_default_device_for_type (data, driver_type) != NULL;
++}
++
++static gboolean is_default_device (SensorData *data,
++				   SensorDevice *sensor_device)
++{
++	SensorDevice *default_device;
++
++	default_device = find_default_device_for_type (data, device_type (sensor_device));
++
++	return default_device == sensor_device;
++}
++
++static gboolean
++has_hinge_angle_sensor (SensorData *data)
++{
++	SensorDevice *display_accel, *base_accel;
++
++	if (driver_type_exists (data, DRIVER_TYPE_HINGE_ANGLE)) {
++		return TRUE;
++	}
++
++	display_accel = find_accel_at (data, ACCEL_LOCATION_DISPLAY);
++	base_accel = find_accel_at (data, ACCEL_LOCATION_BASE);
++
++	return display_accel && base_accel;
+ }
+ 
+ static gboolean
+@@ -130,24 +228,28 @@ find_sensors (GUdevClient *client,
+ 
+ 		for (i = 0; i < G_N_ELEMENTS(drivers); i++) {
+ 			SensorDriver *driver = (SensorDriver *) drivers[i];
+-			if (!driver_type_exists (data, driver->type) &&
+-			    driver_discover (driver, dev)) {
++			SensorDevice *sensor_device;
++
++			if (driver_discover (driver, dev)) {
+ 				g_debug ("Found device %s of type %s at %s",
+ 					 g_udev_device_get_sysfs_path (dev),
+ 					 driver_type_to_str (driver->type),
+ 					 driver->driver_name);
+-				UDEV_DEVICE_FOR_TYPE(driver->type) = g_object_ref (dev);
+-				DRIVER_FOR_TYPE(driver->type) = (SensorDriver *) driver;
++
++
++				sensor_device = driver_open (driver, dev,
++						driver_type_to_callback_func (driver->type), data);
++				if (!sensor_device) {
++					g_clear_object (&dev);
++					continue;
++				}
++
++				g_ptr_array_add (data->devices[driver->type], sensor_device);
+ 
+ 				found = TRUE;
++				break;
+ 			}
+ 		}
+-
+-		if (driver_type_exists (data, DRIVER_TYPE_ACCEL) &&
+-		    driver_type_exists (data, DRIVER_TYPE_LIGHT) &&
+-		    driver_type_exists (data, DRIVER_TYPE_PROXIMITY) &&
+-		    driver_type_exists (data, DRIVER_TYPE_COMPASS))
+-			break;
+ 	}
+ 
+ 	g_list_free_full (devices, g_object_unref);
+@@ -180,6 +282,9 @@ typedef enum {
+ 	PROP_COMPASS_HEADING            = 1 << 5,
+ 	PROP_HAS_PROXIMITY              = 1 << 6,
+ 	PROP_PROXIMITY_NEAR             = 1 << 7,
++	PROP_HAS_HINGE_ANGLE		= 1 << 8,
++	PROP_HINGE_ANGLE		= 1 << 9,
++	PROP_TABLET_MODE		= 1 << 10,
+ } PropertiesMask;
+ 
+ #define PROP_ALL (PROP_HAS_ACCELEROMETER | \
+@@ -187,9 +292,17 @@ typedef enum {
+                   PROP_HAS_AMBIENT_LIGHT | \
+                   PROP_LIGHT_LEVEL | \
+                   PROP_HAS_PROXIMITY | \
+-		  PROP_PROXIMITY_NEAR)
++		  PROP_PROXIMITY_NEAR | \
++		  PROP_HAS_HINGE_ANGLE | \
++		  PROP_HINGE_ANGLE | \
++		  PROP_TABLET_MODE)
+ #define PROP_ALL_COMPASS (PROP_HAS_COMPASS | \
+ 			  PROP_COMPASS_HEADING)
++#define PROP_ALL_HAS (PROP_HAS_ACCELEROMETER | \
++		      PROP_HAS_AMBIENT_LIGHT | \
++		      PROP_HAS_PROXIMITY | \
++		      PROP_HAS_COMPASS | \
++		      PROP_HAS_HINGE_ANGLE)
+ 
+ static PropertiesMask
+ mask_for_sensor_type (DriverType sensor_type)
+@@ -207,6 +320,10 @@ mask_for_sensor_type (DriverType sensor_type)
+ 	case DRIVER_TYPE_PROXIMITY:
+ 		return PROP_HAS_PROXIMITY |
+ 			PROP_PROXIMITY_NEAR;
++	case DRIVER_TYPE_HINGE_ANGLE:
++		return PROP_HAS_HINGE_ANGLE |
++			PROP_HINGE_ANGLE |
++			PROP_TABLET_MODE;
+ 	default:
+ 		g_assert_not_reached ();
+ 	}
+@@ -296,6 +413,48 @@ send_dbus_event_for_client (SensorData     *data,
+ 				       g_variant_new_boolean (data->previous_prox_near));
+ 	}
+ 
++	if (mask & PROP_HAS_HINGE_ANGLE) {
++		gboolean has_hinge_angle;
++
++		has_hinge_angle = driver_type_exists (data, DRIVER_TYPE_HINGE_ANGLE);
++
++		if (!has_hinge_angle) {
++			gboolean has_display_accel = FALSE, has_base_accel = FALSE;
++			guint i;
++
++			for (i = 0; i < data->devices[DRIVER_TYPE_ACCEL]->len; i++) {
++				SensorDevice *sensor_device =
++					g_ptr_array_index (data->devices[DRIVER_TYPE_ACCEL], i);
++
++				if (sensor_device->location == ACCEL_LOCATION_DISPLAY)
++					has_display_accel = TRUE;
++
++				if (sensor_device->location == ACCEL_LOCATION_BASE)
++					has_base_accel = TRUE;
++			}
++
++			has_hinge_angle = has_display_accel && has_base_accel;
++		}
++
++		g_variant_builder_add (&props_builder, "{sv}", "HasHingeAngle",
++				       g_variant_new_boolean (has_hinge_angle));
++
++		/* Send hinge angle information when the device appears */
++		if (has_hinge_angle)
++			mask |= PROP_HINGE_ANGLE | PROP_TABLET_MODE;
++	}
++
++	if (mask & PROP_HINGE_ANGLE) {
++		g_variant_builder_add (&props_builder, "{sv}", "HingeAngle",
++				       g_variant_new_double (data->previous_hinge_angle));
++	}
++
++	if (mask & PROP_TABLET_MODE) {
++		g_variant_builder_add (&props_builder, "{sv}", "TabletMode",
++				      g_variant_new_string (tablet_mode_to_str (data->previous_tablet_mode)));
++
++	}
++
+ 	props_changed = g_variant_new ("(s@a{sv}@as)", (mask & PROP_ALL) ? SENSOR_PROXY_IFACE_NAME : SENSOR_PROXY_COMPASS_IFACE_NAME,
+ 				       g_variant_builder_end (&props_builder),
+ 				       g_variant_new_strv (NULL, 0));
+@@ -355,6 +514,8 @@ send_driver_changed_dbus_event (SensorData   *data,
+ 		send_dbus_event (data, PROP_HAS_AMBIENT_LIGHT);
+ 	else if (driver_type == DRIVER_TYPE_PROXIMITY)
+ 		send_dbus_event (data, PROP_HAS_PROXIMITY);
++	else if (driver_type == DRIVER_TYPE_HINGE_ANGLE)
++		send_dbus_event (data, PROP_HAS_HINGE_ANGLE);
+ 	else if (driver_type == DRIVER_TYPE_COMPASS)
+ 		send_dbus_event (data, PROP_HAS_COMPASS);
+ 	else
+@@ -364,26 +525,153 @@ send_driver_changed_dbus_event (SensorData   *data,
+ static gboolean
+ any_sensors_left (SensorData *data)
+ {
+-	guint i;
+-	gboolean exists = FALSE;
++	int i;
+ 
+-	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
+-		if (driver_type_exists (data, i)) {
+-			exists = TRUE;
+-			break;
+-		}
++	for (i = 0; i < NUM_SENSOR_TYPES; i++)
++		if (data->devices[i]->len > 0)
++			return TRUE;
++
++	return FALSE;
++}
++
++static gboolean
++setup_uinput_dev (SensorData *data)
++{
++	struct uinput_setup usetup;
++	int fd;
++	int r;
++
++	fd = open ("/dev/uinput", O_RDWR);
++	if (fd < 0) {
++		g_warning ("Could not open uinput for tablet mode notification: %s",
++			   strerror (errno));
++		return FALSE;
+ 	}
+ 
+-	return exists;
++	r = ioctl(fd, UI_SET_EVBIT, EV_SW);
++	if (r < 0)
++		goto error;
++
++	r = ioctl(fd, UI_SET_SWBIT, SW_TABLET_MODE);
++	if (r < 0)
++		goto error;
++
++
++	memset (&usetup, 0, sizeof(usetup));
++	snprintf(usetup.name, sizeof(usetup.name), "iio-sensor-proxy");
++	usetup.id.bustype = BUS_VIRTUAL;
++	usetup.id.vendor = 0x00;
++	usetup.id.product = 0x00;
++
++	r = ioctl(fd, UI_DEV_SETUP, &usetup);
++	if (r < 0)
++		goto error;
++
++	r = ioctl(fd, UI_DEV_CREATE);
++	if (r < 0)
++		goto error;
++
++	data->uinput_fd = fd;
++
++	return TRUE;
++
++error:
++	g_warning ("Uinput device setup error: %s", strerror(errno));
++	close (fd);
++
++	return FALSE;
++}
++
++static void
++close_uinput_dev (SensorData *data)
++{
++	if (data->uinput_fd == -1)
++		return;
++
++	ioctl(data->uinput_fd, UI_DEV_DESTROY);
++	close (data->uinput_fd);
++
++	data->uinput_fd = -1;
+ }
+ 
+ static void
+-client_release (SensorData            *data,
+-		const char            *sender,
+-		DriverType             driver_type)
++emit_uinput_event (SensorData *data, int type, int code, int val)
++{
++	struct input_event ev;
++
++	g_debug ("Emitting uinput event: %d %d %d", type, code, val);
++
++	if (data->uinput_fd == -1) {
++		g_warning ("Cannot emit uinput event: device is not initialized");
++		return;
++	}
++
++	ev.type = type;
++	ev.code = code;
++	ev.value = val;
++
++	ev.time.tv_sec = 0;
++	ev.time.tv_usec = 0;
++
++	write (data->uinput_fd, &ev, sizeof(ev));
++}
++
++static void
++virt_hinge_angle_sensor_start (SensorData *data)
++{
++	SensorDevice *display_accel, *base_accel;
++	GHashTable *ht;
++
++	display_accel = find_accel_at (data, ACCEL_LOCATION_DISPLAY);
++	base_accel = find_accel_at (data, ACCEL_LOCATION_BASE);
++
++	if (!display_accel || !base_accel) {
++		return;
++	}
++
++	ht = data->clients[DRIVER_TYPE_ACCEL];
++
++	/* If the virtual hinge angle sensor is claimed but no accelerometer
++	 * were claimed before, start polling for default (display) accelerometer */
++	if (g_hash_table_size (ht) == 0) {
++		driver_set_polling (display_accel, TRUE);
++	}
++
++	driver_set_polling (base_accel, TRUE);
++}
++
++static void
++virt_hinge_angle_sensor_stop (SensorData *data)
++{
++	SensorDevice *display_accel, *base_accel;
++	GHashTable *ht;
++
++	display_accel = find_accel_at (data, ACCEL_LOCATION_DISPLAY);
++	base_accel = find_accel_at (data, ACCEL_LOCATION_BASE);
++
++	if (!display_accel || !base_accel) {
++		return;
++	}
++
++	ht = data->clients[DRIVER_TYPE_ACCEL];
++
++	/* If the virtual hinge angle sensor was claimed but no accelerometer
++	 * were claimed before, stop polling for default (display) accelerometer */
++	if (g_hash_table_size (ht) == 0) {
++		driver_set_polling (display_accel, FALSE);
++	}
++
++	driver_set_polling (base_accel, FALSE);
++}
++
++static void
++client_release (SensorData *data,
++		const char *sender,
++		DriverType  driver_type)
+ {
+ 	GHashTable *ht;
+ 	guint watch_id;
++	SensorDevice *sensor_device;
+ 
+ 	ht = data->clients[driver_type];
+ 
+@@ -395,11 +683,17 @@ client_release (SensorData            *data,
+ 
+ 	g_hash_table_remove (ht, sender);
+ 
+-	if (driver_type_exists (data, driver_type) &&
+-	    g_hash_table_size (ht) == 0) {
+-		SensorDevice *sensor_device = DEVICE_FOR_TYPE(driver_type);
+-		driver_set_polling (sensor_device, FALSE);
++	sensor_device = find_default_device_for_type (data, driver_type);
++	if (g_hash_table_size (ht) == 0) {
++		if (sensor_device) {
++			driver_set_polling (sensor_device, FALSE);
++		} else {
++			if (driver_type == DRIVER_TYPE_HINGE_ANGLE) {
++				virt_hinge_angle_sensor_stop (data);
++			}
++		}
+ 	}
++
+ }
+ 
+ static void
+@@ -471,10 +765,13 @@ handle_generic_method_call (SensorData            *data,
+ {
+ 	GHashTable *ht;
+ 	guint watch_id;
++	SensorDevice *sensor_device;
+ 
+ 	g_debug ("Handling driver refcounting method '%s' for %s device",
+ 		 method_name, driver_type_to_str (driver_type));
+ 
++	sensor_device = find_default_device_for_type (data, driver_type);
++
+ 	ht = data->clients[driver_type];
+ 
+ 	if (g_str_has_prefix (method_name, "Claim")) {
+@@ -486,12 +783,17 @@ handle_generic_method_call (SensorData            *data,
+ 		}
+ 
+ 		/* No other clients for this sensor? Start it */
+-		if (driver_type_exists (data, driver_type) &&
+-		    g_hash_table_size (ht) == 0) {
+-			SensorDevice *sensor_device = DEVICE_FOR_TYPE(driver_type);
+-			driver_set_polling (sensor_device, TRUE);
++		if (g_hash_table_size (ht) == 0) {
++			if (sensor_device) {
++				driver_set_polling (sensor_device, TRUE);
++			} else {
++				if (driver_type == DRIVER_TYPE_HINGE_ANGLE) {
++					virt_hinge_angle_sensor_start (data);
++				}
++			}
+ 		}
+ 
++
+ 		watch_id = g_bus_watch_name_on_connection (data->connection,
+ 							   sender,
+ 							   G_BUS_NAME_WATCHER_FLAGS_NONE,
+@@ -531,6 +833,9 @@ handle_method_call (GDBusConnection       *connection,
+ 	else if (g_strcmp0 (method_name, "ClaimProximity") == 0 ||
+ 		 g_strcmp0 (method_name, "ReleaseProximity") == 0)
+ 	        driver_type = DRIVER_TYPE_PROXIMITY;
++	else if (g_strcmp0 (method_name, "ClaimHingeAngle") == 0 ||
++		 g_strcmp0 (method_name, "ReleaseHingeAngle") == 0)
++	        driver_type = DRIVER_TYPE_HINGE_ANGLE;
+ 	else {
+ 		g_dbus_method_invocation_return_error (invocation,
+ 						       G_DBUS_ERROR,
+@@ -577,6 +882,12 @@ handle_get_property (GDBusConnection *connection,
+ 		return g_variant_new_boolean (driver_type_exists (data, DRIVER_TYPE_PROXIMITY));
+ 	if (g_strcmp0 (property_name, "ProximityNear") == 0)
+ 		return g_variant_new_boolean (data->previous_prox_near);
++	if (g_strcmp0 (property_name, "HasHingeAngle") == 0)
++		return g_variant_new_boolean (has_hinge_angle_sensor (data));
++	if (g_strcmp0 (property_name, "HingeAngle") == 0)
++		return g_variant_new_double (data->previous_hinge_angle);
++	if (g_strcmp0 (property_name, "TabletMode") == 0)
++		return g_variant_new_string (tablet_mode_to_str (data->previous_tablet_mode));
+ 
+ 	return NULL;
+ }
+@@ -629,7 +940,7 @@ handle_compass_get_property (GDBusConnection *connection,
+ 	g_assert (data->connection);
+ 
+ 	if (g_strcmp0 (property_name, "HasCompass") == 0)
+-		return g_variant_new_boolean (data->drivers[DRIVER_TYPE_COMPASS] != NULL);
++		return g_variant_new_boolean (driver_type_exists (data, DRIVER_TYPE_COMPASS));
+ 	if (g_strcmp0 (property_name, "CompassHeading") == 0)
+ 		return g_variant_new_double (data->previous_heading);
+ 
+@@ -695,27 +1006,9 @@ name_acquired_handler (GDBusConnection *connection,
+ 			  G_CALLBACK (sensor_changes), data);
+ 
+ 	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
+-		SensorDevice *sensor_device;
+-
+ 		data->clients[i] = create_clients_hash_table ();
+-
+-		if (!driver_type_exists (data, i))
+-			continue;
+-
+-		sensor_device = driver_open (DRIVER_FOR_TYPE(i), UDEV_DEVICE_FOR_TYPE(i),
+-					     driver_type_to_callback_func (data->drivers[i]->type), data);
+-		if (!sensor_device) {
+-			DRIVER_FOR_TYPE(i) = NULL;
+-			g_clear_object (&UDEV_DEVICE_FOR_TYPE(i));
+-			continue;
+-		}
+-
+-		DEVICE_FOR_TYPE(i) = sensor_device;
+ 	}
+ 
+-	if (!any_sensors_left (data))
+-		goto bail;
+-
+ 	send_dbus_event (data, PROP_ALL);
+ 	send_dbus_event (data, PROP_ALL_COMPASS);
+ 	return;
+@@ -756,6 +1049,189 @@ setup_dbus (SensorData *data,
+ 	return TRUE;
+ }
+ 
++static TabletMode
++calc_tablet_mode (gdouble hinge_angle)
++{
++	/* If hinge axle is vertical */
++	if (hinge_angle < 0)
++		return TABLET_MODE_UNKNOWN;
++
++	return hinge_angle < 190 ? TABLET_MODE_LAPTOP : TABLET_MODE_TABLET;
++}
++
++static void
++hinge_angle_changed_func (SensorDevice *sensor_device,
++			  gpointer      readings_data,
++			  gpointer      user_data)
++{
++	SensorData *data = user_data;
++	HingeAngleReadings *readings = (HingeAngleReadings *) readings_data;
++	TabletMode tablet_mode;
++	PropertiesMask mask = 0;
++
++	g_debug ("Hinge angle sent by driver: %f",
++	         readings->angle);
++
++	if (data->previous_hinge_angle != readings->angle) {
++		gdouble tmp;
++
++		tmp = data->previous_hinge_angle;
++		data->previous_hinge_angle = readings->angle;
++
++		mask |= PROP_HINGE_ANGLE;
++		g_debug ("Emitting hinge angle changed: from %.1f to %.1f",
++			 tmp, data->previous_hinge_angle);
++	}
++
++	//FIXME: Add hysteresis
++	tablet_mode = calc_tablet_mode (readings->angle);
++	if (data->previous_tablet_mode != tablet_mode) {
++		TabletMode tmp;
++
++		tmp = data->previous_tablet_mode;
++		data->previous_tablet_mode = tablet_mode;
++
++		mask |= PROP_TABLET_MODE;
++		g_debug ("Emitting tablet mode changed: from %s to %s",
++			 tablet_mode_to_str (tmp),
++			 tablet_mode_to_str (data->previous_tablet_mode));
++
++		emit_uinput_event (data, EV_SW, SW_TABLET_MODE,
++				tablet_mode == TABLET_MODE_TABLET);
++		emit_uinput_event (data, EV_SYN, SYN_REPORT, 0);
++	}
++
++	if (mask) {
++		send_dbus_event (data, mask);
++	}
++}
++
++//FIXME: Use D-Bus GLib API for this
++static gboolean
++lid_is_closed (void)
++{
++	int exit_code;
++
++	exit_code = system ("busctl get-property org.freedesktop.login1 /org/freedesktop/login1 "
++			   "org.freedesktop.login1.Manager LidClosed | grep true");
++
++	return !exit_code;
++}
++
++static double
++calc_2d_angle(SensorData *data)
++{
++	double angle_disp = atan2 (data->last_accel_readings[ACCEL_LOCATION_DISPLAY].accel_z,
++				    data->last_accel_readings[ACCEL_LOCATION_DISPLAY].accel_y) * 180 / M_PI;
++	double angle_base = atan2 (data->last_accel_readings[ACCEL_LOCATION_BASE].accel_z,
++				   data->last_accel_readings[ACCEL_LOCATION_BASE].accel_y) * 180 / M_PI;
++
++	g_debug ("display angle: %.1f, base angle: %.1f", angle_disp, angle_base);
++
++	double hinge_angle = (angle_base - angle_disp);
++
++	if (hinge_angle < 0)
++		hinge_angle += 360;
++
++	hinge_angle = 360 - hinge_angle;
++
++	return hinge_angle;
++}
++
++static double
++calc_3d_angle(SensorData *data)
++{
++	double display_x, display_y, display_z;
++	double base_x, base_y, base_z;
++	double display_norm_x, display_norm_y, display_norm_z;
++	double base_norm_x, base_norm_y, base_norm_z;
++
++	display_x = data->last_accel_readings[ACCEL_LOCATION_DISPLAY].accel_x;
++	display_y = data->last_accel_readings[ACCEL_LOCATION_DISPLAY].accel_y;
++	display_z = data->last_accel_readings[ACCEL_LOCATION_DISPLAY].accel_z;
++	base_x = data->last_accel_readings[ACCEL_LOCATION_BASE].accel_x;
++	base_y = data->last_accel_readings[ACCEL_LOCATION_BASE].accel_y;
++	base_z = data->last_accel_readings[ACCEL_LOCATION_BASE].accel_z;
++
++	double display_length = sqrt (display_x * display_x +
++				      display_y * display_y +
++				      display_z * display_z);
++	double base_length = sqrt (base_x * base_x +
++				   base_y * base_y +
++				   base_z * base_z);
++
++	display_norm_x = display_x / display_length;
++	display_norm_y = display_y / display_length;
++	display_norm_z = display_z / display_length;
++
++	base_norm_x = base_x / base_length;
++	base_norm_y = base_y / base_length;
++	base_norm_z = base_z / base_length;
++
++	double hinge_angle = acos (display_norm_x * base_norm_x +
++				   display_norm_y * base_norm_y +
++				   display_norm_z * base_norm_z)
++				   * 180 / M_PI;
++
++	double direction = (display_y * base_z) - (display_z * base_y);
++
++	if (direction > 0)
++		hinge_angle = 360 - hinge_angle;
++
++	return hinge_angle;
++}
++
++static void
++calc_accel_hinge_angle(SensorData *data)
++{
++	HingeAngleReadings hinge_angle_readings;
++	double axle_angle;
++	double hinge_angle, hinge_angle2d, hinge_angle3d;
++	AccelReadings r;
++
++	r = data->last_accel_readings[ACCEL_LOCATION_DISPLAY];
++
++	axle_angle = atan2 (sqrt ((double)r.accel_z * r.accel_z + (double)r.accel_y * r.accel_y), r.accel_x) * 180 / M_PI;
++
++	g_debug ("Hinge axle angle: %.1f degrees (x: %d, y: %d, z: %d)", axle_angle, r.accel_x, r.accel_y, r.accel_z);
++
++	/* We cannot calc hinge angle reliable if hinge axle is almost vertical */
++	if ((axle_angle < 25) || (axle_angle > 155)) {
++		g_debug ("Hinge axle is vertical, cannot calc bending angle");
++		return;
++	}
++
++	hinge_angle2d = calc_2d_angle (data);
++	hinge_angle3d = calc_3d_angle (data);
++
++	g_debug ("2d angle: %.1f", hinge_angle2d);
++	g_debug ("3d angle: %.1f", hinge_angle3d);
++
++	if (hinge_angle3d < 15)
++		hinge_angle = hinge_angle3d;
++	else
++		hinge_angle = hinge_angle2d;
++
++	gboolean lid_closed = lid_is_closed ();
++
++	/*
++	 * Handle the corner case: tablet is closed or bended by 360 deg.
++	 * the calculated hinge angle may be wrapped around 0/360 deg. here,
++	 * check the lid state and normalize
++	 */
++	if (lid_closed)
++		hinge_angle = 0;
++	else if (hinge_angle < 15)
++		hinge_angle = 360;
++
++	//FIXME: Add data validations to filter invalid values caused by vibration
++	g_debug ("Hinge angle is %.1f degrees", hinge_angle);
++
++	hinge_angle_readings.angle = hinge_angle;
++
++	hinge_angle_changed_func (NULL, &hinge_angle_readings, data);
++}
++
+ static void
+ accel_changed_func (SensorDevice *sensor_device,
+ 		    gpointer      readings_data,
+@@ -766,24 +1242,45 @@ accel_changed_func (SensorDevice *sensor_device,
+ 	OrientationUp orientation;
+ 
+ 	//FIXME handle errors
+-	g_debug ("Accel sent by driver (quirk applied): %d, %d, %d (scale: %lf,%lf,%lf)",
++	g_debug ("Accel (%s) sent by driver (quirk applied): %d, %d, %d (scale: %lf,%lf,%lf)",
++		 sensor_device->location == ACCEL_LOCATION_DISPLAY ? "display" : "base",
+ 		 readings->accel_x, readings->accel_y, readings->accel_z,
+ 		 readings->scale.x, readings->scale.y, readings->scale.z);
+ 
+-	orientation = orientation_calc (data->previous_orientation,
+-					readings->accel_x, readings->accel_y, readings->accel_z,
+-					readings->scale);
++	gboolean accel_hinge_case =
++		(sensor_device->location == ACCEL_LOCATION_BASE) &&
++		!driver_type_exists (data, DRIVER_TYPE_HINGE_ANGLE);
+ 
+-	if (data->previous_orientation != orientation) {
+-		OrientationUp tmp;
++	if (!is_default_device (data, sensor_device) && !accel_hinge_case) {
++		g_debug ("Skip parsing the readings: %s is not a default device",
++			 sensor_device->name);
++		return;
++	}
++
++	memcpy (&data->last_accel_readings[sensor_device->location],
++	       readings_data, sizeof (AccelReadings));
++
++	if (sensor_device->location == ACCEL_LOCATION_DISPLAY) {
++		orientation = orientation_calc (data->previous_orientation,
++				readings->accel_x, readings->accel_y, readings->accel_z,
++				readings->scale);
+ 
+-		tmp = data->previous_orientation;
+-		data->previous_orientation = orientation;
+-		send_dbus_event (data, PROP_ACCELEROMETER_ORIENTATION);
+-		g_debug ("Emitted orientation changed: from %s to %s",
+-			 orientation_to_string (tmp),
+-			 orientation_to_string (data->previous_orientation));
++		if (data->previous_orientation != orientation) {
++			OrientationUp tmp;
++
++			tmp = data->previous_orientation;
++			data->previous_orientation = orientation;
++			send_dbus_event (data, PROP_ACCELEROMETER_ORIENTATION);
++			g_debug ("Emitted orientation changed: from %s to %s",
++					orientation_to_string (tmp),
++					orientation_to_string (data->previous_orientation));
++		}
+ 	}
++
++	/* Calculate hinge angle based on accelerometers readings if there is no
++	 * dedicated hinge angle sensor exists */
++	if (accel_hinge_case)
++		calc_accel_hinge_angle (data);
+ }
+ 
+ static void
+@@ -798,6 +1295,12 @@ light_changed_func (SensorDevice *sensor_device,
+ 	g_debug ("Light level sent by driver (quirk applied): %lf (unit: %s)",
+ 		 readings->level, data->uses_lux ? "lux" : "vendor");
+ 
++	if (!is_default_device (data, sensor_device)) {
++		g_debug ("Skip parsing the readings: %s is not a default device",
++			 sensor_device->name);
++		return;
++	}
++
+ 	if (data->previous_level != readings->level ||
+ 	    data->uses_lux != readings->uses_lux) {
+ 		gdouble tmp;
+@@ -825,6 +1328,12 @@ compass_changed_func (SensorDevice *sensor_device,
+ 	g_debug ("Heading sent by driver (quirk applied): %lf degrees",
+ 	         readings->heading);
+ 
++	if (!is_default_device (data, sensor_device)) {
++		g_debug ("Skip parsing the readings: %s is not a default device",
++			 sensor_device->name);
++		return;
++	}
++
+ 	if (data->previous_heading != readings->heading) {
+ 		gdouble tmp;
+ 
+@@ -850,6 +1359,12 @@ proximity_changed_func (SensorDevice *sensor_device,
+ 	g_debug ("Proximity sent by driver: %d",
+ 	         readings->is_near);
+ 
++	if (!is_default_device (data, sensor_device)) {
++		g_debug ("Skip parsing the readings: %s is not a default device",
++			 sensor_device->name);
++		return;
++	}
++
+ 	near = readings->is_near > 0;
+ 	if (data->previous_prox_near != near) {
+ 		ProximityNear tmp;
+@@ -875,15 +1390,41 @@ driver_type_to_callback_func (DriverType type)
+ 		return compass_changed_func;
+ 	case DRIVER_TYPE_PROXIMITY:
+ 		return proximity_changed_func;
++	case DRIVER_TYPE_HINGE_ANGLE:
++		return hinge_angle_changed_func;
+ 	default:
+ 		g_assert_not_reached ();
+ 	}
+ }
+ 
++static SensorData *
++allocate_sensor_data (void)
++{
++	SensorData *data;
++	guint i;
++
++	data = g_new0 (SensorData, 1);
++
++	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
++		data->devices[i] = g_ptr_array_new ();
++	}
++
++	data->uinput_fd = -1;
++
++	data->previous_orientation = ORIENTATION_UNDEFINED;
++	data->previous_tablet_mode = TABLET_MODE_UNKNOWN;
++	data->uses_lux = TRUE;
++	data->previous_level = 0.0;
++	data->previous_heading = 0.0;
++	data->previous_prox_near = FALSE;
++
++	return data;
++}
++
+ static void
+ free_sensor_data (SensorData *data)
+ {
+-	guint i;
++	guint i, j;
+ 
+ 	if (data == NULL)
+ 		return;
+@@ -893,11 +1434,17 @@ free_sensor_data (SensorData *data)
+ 		data->name_id = 0;
+ 	}
+ 
++	close_uinput_dev (data);
++
+ 	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
+-		if (driver_type_exists (data, i))
+-			driver_close (DEVICE_FOR_TYPE(i));
+-		g_clear_object (&UDEV_DEVICE_FOR_TYPE(i));
+ 		g_clear_pointer (&data->clients[i], g_hash_table_unref);
++
++		for (j = 0; j < data->devices[i]->len; j++) {
++			SensorDevice *dev = g_ptr_array_index (data->devices[i], j);
++			driver_close (dev);
++		}
++
++		g_ptr_array_free (data->devices[i], TRUE);
+ 	}
+ 
+ 	g_clear_object (&data->auth);
+@@ -914,33 +1461,41 @@ sensor_changes (GUdevClient *client,
+ 		GUdevDevice *device,
+ 		SensorData  *data)
+ {
+-	guint i;
++	guint i, j;
+ 
+ 	g_debug ("Sensor changes: action = %s, device = %s",
+ 		 action, g_udev_device_get_sysfs_path (device));
+ 
+ 	if (g_strcmp0 (action, "remove") == 0) {
++		gboolean found = FALSE;
+ 		for (i = 0; i < NUM_SENSOR_TYPES; i++) {
+-			GUdevDevice *dev = UDEV_DEVICE_FOR_TYPE(i);
++			for (j = 0; j < data->devices[i]->len; j++) {
++				SensorDevice *sensor_device = g_ptr_array_index (data->devices[i], j);
++				GUdevDevice *dev = sensor_device->udev_device;
+ 
+-			if (!dev)
+-				continue;
++				if (g_strcmp0 (g_udev_device_get_sysfs_path (device), g_udev_device_get_sysfs_path (dev)) == 0) {
++					g_debug ("Sensor type %s (%p) got removed (%s)",
++							driver_type_to_str (i),
++							sensor_device,
++							g_udev_device_get_sysfs_path (dev));
+ 
+-			if (g_strcmp0 (g_udev_device_get_sysfs_path (device), g_udev_device_get_sysfs_path (dev)) == 0) {
+-				g_debug ("Sensor type %s got removed (%s)",
+-					 driver_type_to_str (i),
+-					 g_udev_device_get_sysfs_path (dev));
++					driver_close (sensor_device);
+ 
+-				g_clear_object (&UDEV_DEVICE_FOR_TYPE(i));
+-				driver_close (DEVICE_FOR_TYPE(i));
+-				DEVICE_FOR_TYPE(i) = NULL;
+-				DRIVER_FOR_TYPE(i) = NULL;
++					g_ptr_array_remove_index (data->devices[i], j);
+ 
+-				g_clear_pointer (&data->clients[i], g_hash_table_unref);
+-				data->clients[i] = create_clients_hash_table ();
++					if (!find_default_device_for_type (data, i)) {
++						g_clear_pointer (&data->clients[i], g_hash_table_unref);
++						data->clients[i] = create_clients_hash_table ();
++					}
+ 
+-				send_driver_changed_dbus_event (data, i);
++					send_driver_changed_dbus_event (data, i);
++					found = TRUE;
++					break;
++				}
+ 			}
++
++			if (found)
++				break;
+ 		}
+ 
+ 		if (!any_sensors_left (data))
+@@ -948,10 +1503,9 @@ sensor_changes (GUdevClient *client,
+ 	} else if (g_strcmp0 (action, "add") == 0) {
+ 		for (i = 0; i < G_N_ELEMENTS(drivers); i++) {
+ 			SensorDriver *driver = (SensorDriver *) drivers[i];
+-			if (!driver_type_exists (data, driver->type) &&
+-			    driver_discover (driver, device)) {
+-				SensorDevice *sensor_device = NULL;
+ 
++			if (driver_discover (driver, device)) {
++				SensorDevice *sensor_device = NULL;
+ 				g_debug ("Found hotplugged device %s of type %s at %s",
+ 					 g_udev_device_get_sysfs_path (device),
+ 					 driver_type_to_str (driver->type),
+@@ -963,15 +1517,12 @@ sensor_changes (GUdevClient *client,
+ 				if (sensor_device) {
+ 					GHashTable *ht;
+ 
+-					UDEV_DEVICE_FOR_TYPE(driver->type) = g_object_ref (device);
+-					DEVICE_FOR_TYPE(driver->type) = sensor_device;
+-					DRIVER_FOR_TYPE(driver->type) = (SensorDriver *) driver;
++					g_ptr_array_add (data->devices[driver->type], sensor_device);
+ 					send_driver_changed_dbus_event (data, driver->type);
+ 
+ 					ht = data->clients[driver->type];
+ 
+ 					if (g_hash_table_size (ht) > 0) {
+-						SensorDevice *sensor_device = DEVICE_FOR_TYPE(driver->type);
+ 						driver_set_polling (sensor_device, TRUE);
+ 					}
+ 				}
+@@ -981,6 +1532,17 @@ sensor_changes (GUdevClient *client,
+ 	}
+ }
+ 
++gboolean
++termination_signal_handler (gpointer user_data)
++{
++	SensorData *data = user_data;
++
++	g_debug ("Shutting down");
++	g_main_loop_quit (data->loop);
++
++	return G_SOURCE_REMOVE;
++}
++
+ int main (int argc, char **argv)
+ {
+ 	SensorData *data;
+@@ -1013,15 +1575,19 @@ int main (int argc, char **argv)
+ 		g_debug ("Starting iio-sensor-proxy version "VERSION);
+ 	}
+ 
+-	data = g_new0 (SensorData, 1);
+-	data->previous_orientation = ORIENTATION_UNDEFINED;
+-	data->uses_lux = TRUE;
++	data = allocate_sensor_data ();
++
++	setup_uinput_dev (data);
+ 
+ 	/* Set up D-Bus */
+ 	setup_dbus (data, replace);
+ 
+ 	data->auth = polkit_authority_get_sync (NULL, NULL);
+-	data->loop = g_main_loop_new (NULL, TRUE);
++	data->loop = g_main_loop_new (NULL, FALSE);
++
++	g_unix_signal_add (SIGINT, (GSourceFunc) termination_signal_handler, data);
++	g_unix_signal_add (SIGTERM, (GSourceFunc) termination_signal_handler, data);
++
+ 	g_main_loop_run (data->loop);
+ 	ret = data->ret;
+ 	free_sensor_data (data);
+diff --git a/src/monitor-sensor.c b/src/monitor-sensor.c
+index ea3f9ec..11b5ba3 100644
+--- a/src/monitor-sensor.c
++++ b/src/monitor-sensor.c
+@@ -18,6 +18,7 @@ static gboolean watch_accel = FALSE;
+ static gboolean watch_prox = FALSE;
+ static gboolean watch_compass = FALSE;
+ static gboolean watch_light = FALSE;
++static gboolean watch_hinge_angle = FALSE;
+ 
+ static void
+ properties_changed (GDBusProxy *proxy,
+@@ -68,6 +69,24 @@ properties_changed (GDBusProxy *proxy,
+ 			g_print ("--- Proximity sensor disappeared\n");
+ 		g_variant_unref (v);
+ 	}
++	if (g_variant_dict_contains (&dict, "HasHingeAngle")) {
++		v = g_dbus_proxy_get_cached_property (iio_proxy, "HasHingeAngle");
++		if (g_variant_get_boolean (v))
++			g_print ("+++ Hinge angle sensor appeared\n");
++		else
++			g_print ("--- Hinge angle sensor disappeared\n");
++		g_variant_unref (v);
++	}
++	if (g_variant_dict_contains (&dict, "HingeAngle")) {
++		v = g_dbus_proxy_get_cached_property (iio_proxy, "HingeAngle");
++		g_print ("    Hinge angle changed: %.1f\n", g_variant_get_double (v));
++		g_variant_unref (v);
++	}
++	if (g_variant_dict_contains (&dict, "TabletMode")) {
++		v = g_dbus_proxy_get_cached_property (iio_proxy, "TabletMode");
++		g_print ("    Tablet mode changed: %s\n", g_variant_get_string (v, NULL));
++		g_variant_unref (v);
++	}
+ 	if (g_variant_dict_contains (&dict, "ProximityNear")) {
+ 		v = g_dbus_proxy_get_cached_property (iio_proxy, "ProximityNear");
+ 		g_print ("    Proximity value changed: %d\n", g_variant_get_boolean (v));
+@@ -139,6 +158,19 @@ print_initial_values (void)
+ 		g_variant_unref (v);
+ 	}
+ 
++	if (watch_hinge_angle) {
++		v = g_dbus_proxy_get_cached_property (iio_proxy, "HasHingeAngle");
++		if (g_variant_get_boolean (v)) {
++			g_variant_unref (v);
++			v = g_dbus_proxy_get_cached_property (iio_proxy, "HingeAngle");
++			g_print ("=== Has hinge angle sensor (angle: %.1f)\n",
++				 g_variant_get_double (v));
++		} else {
++			g_print ("=== No hinge angle sensor\n");
++		}
++		g_variant_unref (v);
++	}
++
+ 	if (!iio_proxy_compass)
+ 		return;
+ 
+@@ -245,6 +277,23 @@ appeared_cb (GDBusConnection *connection,
+ 		g_clear_pointer (&ret, g_variant_unref);
+ 	}
+ 
++	/* Hinge angle sensor */
++	if (watch_hinge_angle) {
++		ret = g_dbus_proxy_call_sync (iio_proxy,
++					      "ClaimHingeAngle",
++					      NULL,
++					      G_DBUS_CALL_FLAGS_NONE,
++					      -1,
++					      NULL, &error);
++		if (!ret) {
++			if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++				g_warning ("Failed to claim hinge angle sensor: %s", error->message);
++			g_main_loop_quit (loop);
++			return;
++		}
++		g_clear_pointer (&ret, g_variant_unref);
++	}
++
+ 	/* Compass */
+ 	if (watch_compass) {
+ 		ret = g_dbus_proxy_call_sync (iio_proxy_compass,
+@@ -285,6 +334,7 @@ int main (int argc, char **argv)
+ 	gboolean opt_watch_prox = FALSE;
+ 	gboolean opt_watch_compass = FALSE;
+ 	gboolean opt_watch_light = FALSE;
++	gboolean opt_watch_hinge_angle = FALSE;
+ 	gboolean opt_all = FALSE;
+ 	const GOptionEntry options[] = {
+ 		{ "all", 'a', 0, G_OPTION_ARG_NONE, &opt_all, "Monitor all the sensor changes", NULL },
+@@ -292,6 +342,7 @@ int main (int argc, char **argv)
+ 		{ "proximity", 0, 0, G_OPTION_ARG_NONE, &opt_watch_prox, "Monitor proximity sensor changes", NULL },
+ 		{ "compass", 0, 0, G_OPTION_ARG_NONE, &opt_watch_compass, "Monitor compass changes", NULL },
+ 		{ "light", 0, 0, G_OPTION_ARG_NONE, &opt_watch_light, "Monitor light changes changes", NULL },
++		{ "hinge", 0, 0, G_OPTION_ARG_NONE, &opt_watch_hinge_angle, "Monitor hinge angle changes", NULL },
+ 		{ NULL}
+ 	};
+ 	int ret = 0;
+@@ -315,9 +366,10 @@ int main (int argc, char **argv)
+ 	if ((!opt_watch_accel &&
+ 	     !opt_watch_prox &&
+ 	     !opt_watch_compass &&
+-	     !opt_watch_light) ||
++	     !opt_watch_light &&
++	     !opt_watch_hinge_angle) ||
+ 	    opt_all) {
+-		opt_watch_accel = opt_watch_prox = opt_watch_light = TRUE;
++		opt_watch_accel = opt_watch_prox = opt_watch_light = opt_watch_hinge_angle = TRUE;
+ 		opt_watch_compass = g_strcmp0 (g_get_user_name (), "geoclue") == 0;
+ 	}
+ 
+@@ -325,6 +377,7 @@ int main (int argc, char **argv)
+ 	watch_prox = opt_watch_prox;
+ 	watch_compass = opt_watch_compass;
+ 	watch_light = opt_watch_light;
++	watch_hinge_angle = opt_watch_hinge_angle;
+ 
+ 	watch_id = g_bus_watch_name (G_BUS_TYPE_SYSTEM,
+ 				     "net.hadess.SensorProxy",
+diff --git a/src/net.hadess.SensorProxy.xml b/src/net.hadess.SensorProxy.xml
+index 620044a..23cac76 100644
+--- a/src/net.hadess.SensorProxy.xml
++++ b/src/net.hadess.SensorProxy.xml
+@@ -100,6 +100,11 @@
+     -->
+     <property name='ProximityNear' type='b' access='read'/>
+ 
++    <property name="HasHingeAngle" type="b" access="read"/>
++    <property name="HingeAngle" type="d" access="read"/>
++    <property name="TabletMode" type="s" access="read"/>
++    <method name="ClaimHingeAngle"/>
++    <method name="ReleaseHingeAngle"/>
+     <!--
+        ClaimAccelerometer:
+ 

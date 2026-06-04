@@ -1,0 +1,1 @@
+let's assume this dir will be in /etc/nixos/
